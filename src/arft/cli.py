@@ -53,6 +53,10 @@ except Exception as exc:  # pragma: no cover
 
 # ----------------------------- Data structures ----------------------------- #
 
+VERBOSE_ADB = False
+ADB_LOGGER: Optional[logging.Logger] = None
+ADB_EXECUTABLE: Optional[str] = None
+
 @dataclass
 class RemoteFile:
     relpath: str
@@ -79,6 +83,13 @@ def run(
     timeout: Optional[int] = None,
 ) -> subprocess.CompletedProcess:
     """Thin wrapper around subprocess.run with consistent defaults."""
+    if VERBOSE_ADB and ADB_LOGGER and cmd:
+        executable = os.path.normcase(os.path.normpath(cmd[0]))
+        configured = os.path.normcase(os.path.normpath(ADB_EXECUTABLE)) if ADB_EXECUTABLE else None
+        if configured is None or executable == configured:
+            # Use shell-style quoting so the emitted command is copy-pasteable and
+            # easy to grep in the persistent transfer log.
+            ADB_LOGGER.info("ADB CMD: %s", shlex.join(cmd))
     return subprocess.run(
         cmd,
         text=text,
@@ -835,10 +846,13 @@ def sleep_retry(retry_wait: float, attempt: int, total: int) -> None:
 # ---------------------------------- Main ---------------------------------- #
 
 def main(argv: Optional[List[str]] = None) -> int:
+    global VERBOSE_ADB, ADB_LOGGER, ADB_EXECUTABLE
+
     parser = argparse.ArgumentParser(description="Robust file-by-file Android pull over ADB with tqdm, retries, and logging.")
     parser.add_argument("--adb-path", required=True, help="Path to adb.exe or adb.")
     parser.add_argument("--remote-root", required=True, help="Remote Android root, e.g. /storage/emulated/0/DCIM")
     parser.add_argument("--local-root", required=True, help="Destination directory on the PC")
+    parser.add_argument("--verbose", action="store_true", help="Log every issued ADB command")
     parser.add_argument("--verify-hash", action="store_true", help="Verify SHA-256 after size verification")
     parser.add_argument("--force-all", action="store_true", help="Re-copy all files even if already present and complete")
     parser.add_argument("--refresh-file-list", action="store_true", help="Refresh the cached remote file list without forcing re-copy of already complete files")
@@ -855,6 +869,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     local_root = Path(args.local_root).expanduser().resolve()
 
     logger = configure_logger(local_root)
+    VERBOSE_ADB = args.verbose
+    ADB_LOGGER = logger
+    ADB_EXECUTABLE = adb_path
 
     try:
         ensure_adb_device(adb_path)
@@ -940,49 +957,63 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Work out which files still need action.
     todo: List[RemoteFile] = []
     skipped = 0
-    for rf in remote_files:
-        local_path = local_root / Path(rf.relpath)
-        complete = False
-        if not args.force_all:
-            if args.skip_all_checks and local_file_exists_for_fast_skip(local_path):
-                complete = True
-            elif manifest_says_file_is_complete(local_path, rf.relpath, manifest) and not effective_check_all_files:
-                complete = True
-                entry = manifest.get(rf.relpath, {})
-                if isinstance(entry.get("size"), int):
-                    rf.size = entry["size"]
-                if isinstance(entry.get("mtime"), int):
-                    rf.mtime = entry["mtime"]
-                if isinstance(entry.get("birth"), int):
-                    rf.birth = entry["birth"]
-            else:
-                try:
-                    complete = file_is_complete(
-                        local_path,
-                        rf,
-                        verify_hash=args.verify_hash,
-                        adb_path=adb_path,
-                        remote_root=remote_root,
-                        hash_cmd=hash_cmd,
-                        logger=logger,
-                        check_all_files=effective_check_all_files,
-                    )
-                except Exception as exc:
-                    logger.warning("Could not validate existing file %s, will re-copy: %s", local_path, exc)
-                    complete = False
+    checking_pbar = tqdm(
+        total=max(len(remote_files), 1),
+        unit="file",
+        desc=f"{infer_remote_root_name(remote_root)} check",
+        dynamic_ncols=True,
+        smoothing=0.1,
+    )
+    try:
+        for rf in remote_files:
+            local_path = local_root / Path(rf.relpath)
+            complete = False
+            if not args.force_all:
+                if args.skip_all_checks and local_file_exists_for_fast_skip(local_path):
+                    complete = True
+                elif manifest_says_file_is_complete(local_path, rf.relpath, manifest) and not effective_check_all_files:
+                    complete = True
+                    entry = manifest.get(rf.relpath, {})
+                    if isinstance(entry.get("size"), int):
+                        rf.size = entry["size"]
+                    if isinstance(entry.get("mtime"), int):
+                        rf.mtime = entry["mtime"]
+                    if isinstance(entry.get("birth"), int):
+                        rf.birth = entry["birth"]
+                else:
+                    try:
+                        complete = file_is_complete(
+                            local_path,
+                            rf,
+                            verify_hash=args.verify_hash,
+                            adb_path=adb_path,
+                            remote_root=remote_root,
+                            hash_cmd=hash_cmd,
+                            logger=logger,
+                            check_all_files=effective_check_all_files,
+                        )
+                    except Exception as exc:
+                        logger.warning("Could not validate existing file %s, will re-copy: %s", local_path, exc)
+                        complete = False
 
-        if complete:
-            skipped += 1
-            manifest[rf.relpath] = {
-                "status": "ok",
-                "size": rf.size,
-                "mtime": rf.mtime,
-                "birth": rf.birth,
-                "local_path": str(local_path),
-                "updated_at": int(time.time()),
-            }
-        else:
-            todo.append(rf)
+            if complete:
+                skipped += 1
+                manifest[rf.relpath] = {
+                    "status": "ok",
+                    "size": rf.size,
+                    "mtime": rf.mtime,
+                    "birth": rf.birth,
+                    "local_path": str(local_path),
+                    "updated_at": int(time.time()),
+                }
+            else:
+                todo.append(rf)
+
+            # Planning progress is intentionally separate from transfer progress
+            # so dry-run and resume decisions remain visible before any copy work.
+            checking_pbar.update(1)
+    finally:
+        checking_pbar.close()
 
     logger.info(
         "Planned transfer: total=%d files, skipped=%d, remaining=%d",
