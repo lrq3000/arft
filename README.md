@@ -4,6 +4,8 @@
 
 It provides robust Android file-by-file transfer over ADB with resumable behavior, atomic writes, lazy remote metadata fetching, cached file-list discovery, and `tqdm` progress reporting.
 
+It was tested on Android 10 and Windows 11 Pro.
+
 ## Features
 
 - atomic operations (ie, crashing in the middle of a file download ensures it will get redownloaded on resuming)
