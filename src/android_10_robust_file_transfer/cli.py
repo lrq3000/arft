@@ -537,6 +537,28 @@ def save_file_list_cache(path: Path, *, remote_root: str, remote_files: List[Rem
     tmp.replace(path)
 
 
+def local_root_has_payload_files(local_root: Path, *, manifest_name: str) -> bool:
+    """
+    Detect whether the destination already contains real payload files.
+
+    We ignore the tool's own bookkeeping files so a fresh run that only created
+    a log file does not accidentally trigger recovery mode.
+    """
+    ignored_names = {
+        manifest_name,
+        ".adb-pull-files.json",
+        ".adb-pull-failed.tsv",
+        ".adb-pull.log",
+    }
+    for path in local_root.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.name in ignored_names:
+            continue
+        return True
+    return False
+
+
 def manifest_says_file_is_complete(
     local_path: Path,
     relpath: str,
@@ -812,9 +834,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.info("Remote hash command detected: %s", hash_cmd)
 
     manifest_path = local_root / args.manifest_name
+    manifest_exists = manifest_path.exists()
     manifest = load_manifest(manifest_path)
     file_list_cache_path = local_root / ".adb-pull-files.json"
+    file_list_cache_exists = file_list_cache_path.exists()
     refresh_file_list = args.force_all or args.refresh_file_list
+    recovery_check_all_files = (
+        not manifest_exists
+        and local_root_has_payload_files(local_root, manifest_name=args.manifest_name)
+    )
+    effective_check_all_files = args.check_all_files or recovery_check_all_files
+
+    if recovery_check_all_files:
+        logger.info(
+            "No manifest was found, but %s already contains files; rebuilding resume state with strict validation",
+            local_root,
+        )
 
     remote_files: Optional[List[RemoteFile]] = None
     if not refresh_file_list:
@@ -841,11 +876,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         save_file_list_cache(file_list_cache_path, remote_root=remote_root, remote_files=remote_files)
         logger.info("Saved remote file list cache to %s", file_list_cache_path)
 
-    if not args.force_all and args.check_all_files and supports_multi_stat:
+    if not args.force_all and effective_check_all_files and supports_multi_stat:
         existing_local_files = [rf for rf in remote_files if (local_root / Path(rf.relpath)).is_file()]
         if existing_local_files:
             logger.info(
-                "Prefetching remote metadata for %d existing local files because --check-all-files was supplied",
+                "Prefetching remote metadata for %d existing local files because strict validation is active",
                 len(existing_local_files),
             )
             try:
@@ -860,7 +895,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         local_path = local_root / Path(rf.relpath)
         complete = False
         if not args.force_all:
-            if manifest_says_file_is_complete(local_path, rf.relpath, manifest) and not args.check_all_files:
+            if manifest_says_file_is_complete(local_path, rf.relpath, manifest) and not effective_check_all_files:
                 complete = True
                 entry = manifest.get(rf.relpath, {})
                 if isinstance(entry.get("size"), int):
@@ -879,7 +914,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         remote_root=remote_root,
                         hash_cmd=hash_cmd,
                         logger=logger,
-                        check_all_files=args.check_all_files,
+                        check_all_files=effective_check_all_files,
                     )
                 except Exception as exc:
                     logger.warning("Could not validate existing file %s, will re-copy: %s", local_path, exc)
