@@ -674,6 +674,23 @@ def local_file_exists_for_fast_skip(local_path: Path) -> bool:
     return local_path.exists() and local_path.is_file()
 
 
+def filter_remote_files(remote_files: List[RemoteFile], exclude_subpaths_re: Optional[re.Pattern[str]], logger: logging.Logger) -> List[RemoteFile]:
+    """
+    Filter remote files by relative path before planning or metadata prefetch.
+
+    The regex is applied to the remote relative path, so users can exclude whole
+    subtrees such as `.thumbnails` or `.Gallery2` anywhere below the chosen
+    remote root.
+    """
+    if exclude_subpaths_re is None:
+        return remote_files
+
+    kept = [rf for rf in remote_files if not exclude_subpaths_re.search(rf.relpath)]
+    excluded = len(remote_files) - len(kept)
+    logger.info("Excluded %d remote files matching --exclude", excluded)
+    return kept
+
+
 def file_is_complete(
     local_path: Path,
     remote_meta: RemoteFile,
@@ -889,6 +906,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--refresh-file-list", action="store_true", help="Refresh the cached remote file list without forcing re-copy of already complete files")
     parser.add_argument("--check-all-files", action="store_true", help="Revalidate already downloaded files against the device before skipping them")
     parser.add_argument("--skip-all-checks", action="store_true", help="Skip all existing-file validation checks and trust any already present local file")
+    parser.add_argument("--exclude", metavar="REGEXP", help="Regex applied to remote relative paths to exclude matching files and subpaths from planning and transfer")
     parser.add_argument("--dry-run", action="store_true", help="List planned actions without copying files")
     parser.add_argument("--retries", type=int, default=3, help="Retries per file on failure (default: 3)")
     parser.add_argument("--retry-wait", type=float, default=2.0, help="Seconds to wait between retries (default: 2.0)")
@@ -919,6 +937,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     hash_cmd: Optional[str] = None
+    exclude_subpaths_re: Optional[re.Pattern[str]] = None
+    if args.exclude:
+        try:
+            exclude_subpaths_re = re.compile(args.exclude)
+        except re.error as exc:
+            logger.error("Invalid --exclude regex: %s", exc)
+            return 2
+        logger.info("Excluding remote relative paths matching regex: %s", args.exclude)
+
     if args.verify_hash:
         hash_cmd = choose_hash_cmd(adb_path)
         if not hash_cmd:
@@ -972,6 +999,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
         save_file_list_cache(file_list_cache_path, remote_root=remote_root, remote_files=remote_files)
         logger.info("Saved remote file list cache to %s", file_list_cache_path)
+
+    remote_files = filter_remote_files(remote_files, exclude_subpaths_re, logger)
 
     if not args.force_all and not args.skip_all_checks and effective_check_all_files and supports_multi_stat:
         existing_local_files = [rf for rf in remote_files if (local_root / Path(rf.relpath)).is_file()]

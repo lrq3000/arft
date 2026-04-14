@@ -63,7 +63,24 @@ arft \
 - `--force-all`: refresh the remote file list and re-copy all files
 - `--check-all-files`: strictly revalidate already-downloaded files against the phone before skipping them; if combined with `--verify-hash`, this also re-checks hashes for those files
 - `--skip-all-checks`: trust any already-present local file immediately and skip all existing-file validation checks; this takes precedence over `--check-all-files` and resume-time hash checking
+- `--exclude REGEXP`: exclude remote relative paths matching a Python regular expression before metadata prefetch, checking, dry-run output, and transfer planning
 - `--dry-run`: print planned files without copying them
+
+### Excluding subpaths with regular expressions
+
+`--exclude` uses a regular expression that is applied to each remote relative path. This is useful for skipping generated media caches or app metadata folders anywhere under the chosen remote root.
+
+Example:
+
+```bash
+arft \
+  --adb-path "C:\platform-tools\adb.exe" \
+  --remote-root "/storage/emulated/0" \
+  --local-root "D:\AndroidBackup" \
+  --exclude "(\.thumbnails|\.Gallery2)"
+```
+
+That example excludes any remote relative path containing either `.thumbnails` or `.Gallery2`.
 
 ## Bookkeeping files created in `--local-root`
 
