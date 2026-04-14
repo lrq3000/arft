@@ -13,16 +13,16 @@ Design goals:
 - Emit detailed logs for later diagnosis.
 
 Typical usage on Windows:
-    python -m android_10_robust_file_transfer ^
+    python -m arft ^
       --adb-path "C:\platform-tools\adb.exe" ^
       --remote-root "/storage/emulated/0/DCIM" ^
       --local-root "D:\AndroidBackup\DCIM"
 
 Optional hash verification:
-    python -m android_10_robust_file_transfer ... --verify-hash
+    python -m arft ... --verify-hash
 
 Force re-copy of everything:
-    python -m android_10_robust_file_transfer ... --force-all
+    python -m arft ... --force-all
 """
 from __future__ import annotations
 

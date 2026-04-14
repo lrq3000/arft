@@ -36,10 +36,8 @@ pip install --upgrade arft
 
 ### As a module
 
-The internal Python module path remains `android_10_robust_file_transfer`.
-
 ```bash
-python -m android_10_robust_file_transfer \
+python -m arft \
   --adb-path "C:\platform-tools\adb.exe" \
   --remote-root "/storage/emulated/0/DCIM" \
   --local-root "D:\AndroidBackup\DCIM"
