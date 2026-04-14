@@ -74,6 +74,21 @@ def quote_remote(path: str) -> str:
     return shlex.quote(path)
 
 
+REMOTE_STAT_META_RE = re.compile(r"([\\\s\[\](){}<>|&;*?!$`\"'#~])")
+
+
+def escape_remote_stat_path(path: str) -> str:
+    """
+    Escape remote paths that are passed as plain 'stat' operands through adb shell.
+
+    Even without an explicit 'sh -c' wrapper, device-side shell parsing can still
+    split or interpret metacharacters before Android's plain stat sees the path.
+    We therefore prefix shell-sensitive characters with backslashes while keeping
+    the existing plain stat output format and parser unchanged.
+    """
+    return REMOTE_STAT_META_RE.sub(r"\\\1", path)
+
+
 def run(
     cmd: List[str],
     *,
@@ -475,7 +490,7 @@ def populate_remote_metadata_batch(
         for start in range(0, len(pending), chunk_size):
             chunk = pending[start:start + chunk_size]
             by_relpath = {rf.relpath: rf for rf in chunk}
-            remote_paths = [remote_join(remote_root, rf.relpath) for rf in chunk]
+            remote_paths = [escape_remote_stat_path(remote_join(remote_root, rf.relpath)) for rf in chunk]
             cp = adb_shell_args(adb_path, ["stat", *remote_paths], check=False)
             parsed = parse_plain_stat_output(cp.stdout or "", remote_root)
 
@@ -515,7 +530,7 @@ def ensure_remote_metadata(adb_path: str, remote_root: str, remote_meta: RemoteF
     if remote_meta.size is not None:
         return remote_meta
 
-    remote_path = remote_join(remote_root, remote_meta.relpath)
+    remote_path = escape_remote_stat_path(remote_join(remote_root, remote_meta.relpath))
     cp = adb_shell_args(adb_path, ["stat", remote_path])
     parsed = parse_plain_stat_output(cp.stdout or "", remote_root)
     metadata = parsed.get(remote_meta.relpath)
