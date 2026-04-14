@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arft"
-version = "0.5.8"
+version = "0.5.9"
 description = "ARFT (Android Robust File Transfer): robust resumable Android file transfer over ADB with atomic operations, resuming, cached discovery and progress reporting."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-  { name = "OpenCode User" }
+  { name = "Stephen Karl Larroque", email = "lrq3000@gmail.com" }
 ]
 dependencies = [
   "tqdm>=4.66"
@@ -31,6 +31,13 @@ classifiers = [
   "Topic :: System :: Archiving :: Backup",
   "Topic :: Utilities"
 ]
+
+[project.urls]
+Homepage = "https://github.com/lrq3000/arft"
+Documentation = "https://github.com/lrq3000/arft/blob/master/README.rst"
+"Source" = "https://github.com/lrq3000/arft"
+Tracker = "https://github.com/lrq3000/arft/issues"
+Download = "https://pypi.org/project/arft/"
 
 [project.scripts]
 arft = "arft.cli:main"
