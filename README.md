@@ -10,6 +10,7 @@ It was tested on Android 10 and Windows 11 Pro.
 
 - atomic operations (ie, crashing in the middle of a file download ensures it will get redownloaded on resuming)
 - resumes safely and fast after interruption
+- resumes downloading even if provided with a partial download started with another app or manually (ie, can be used to incrementally update a backup, previously downloaded files will be checked and only newer/different files will be updated/added)
 - never exposes partial files as completed output
 - validates file size and optionally SHA-256
 - preserves timestamps as closely as Android exposes them
