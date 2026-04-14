@@ -623,9 +623,9 @@ def local_root_has_payload_files(local_root: Path, *, manifest_name: str) -> boo
     """
     ignored_names = {
         manifest_name,
-        ".adb-pull-files.json",
-        ".adb-pull-failed.tsv",
-        ".adb-pull.log",
+        ".arft-remote-files-list.json",
+        ".arft-failed-files.tsv",
+        ".arft.log",
     }
     for path in local_root.rglob("*"):
         if not path.is_file():
@@ -736,7 +736,7 @@ def remote_join(root: str, relpath: str) -> str:
 
 def configure_logger(local_root: Path) -> logging.Logger:
     local_root.mkdir(parents=True, exist_ok=True)
-    log_path = local_root / ".adb-pull.log"
+    log_path = local_root / ".arft.log"
 
     logger = logging.getLogger("adb_pull_robust")
     logger.setLevel(logging.INFO)
@@ -892,7 +892,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="List planned actions without copying files")
     parser.add_argument("--retries", type=int, default=3, help="Retries per file on failure (default: 3)")
     parser.add_argument("--retry-wait", type=float, default=2.0, help="Seconds to wait between retries (default: 2.0)")
-    parser.add_argument("--manifest-name", default=".adb-pull-manifest.json", help="Manifest filename in the destination root")
+    parser.add_argument("--manifest-name", default=".arft-local-sync-state.json", help="Manifest filename in the destination root")
     args = parser.parse_args(argv)
 
     adb_path = args.adb_path
@@ -929,7 +929,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     manifest_path = local_root / args.manifest_name
     manifest_exists = manifest_path.exists()
     manifest = load_manifest(manifest_path)
-    file_list_cache_path = local_root / ".adb-pull-files.json"
+    file_list_cache_path = local_root / ".arft-remote-files-list.json"
     file_list_cache_exists = file_list_cache_path.exists()
     refresh_file_list = args.force_all or args.refresh_file_list
     recovery_check_all_files = (
@@ -1166,7 +1166,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     if failed_files:
-        failed_path = local_root / ".adb-pull-failed.tsv"
+        failed_path = local_root / ".arft-failed-files.tsv"
         with failed_path.open("w", encoding="utf-8", newline="\n") as f:
             f.write("relpath\treason\n")
             for relpath, reason in failed_files:
