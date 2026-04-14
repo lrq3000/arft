@@ -33,6 +33,7 @@ import json
 import logging
 import math
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -97,6 +98,16 @@ def adb_shell(adb_path: str, shell_cmd: str, *, check: bool = True) -> subproces
     return run([adb_path, "shell", "sh", "-c", shell_cmd], check=check)
 
 
+def adb_shell_args(adb_path: str, shell_args: List[str], *, check: bool = True) -> subprocess.CompletedProcess:
+    """
+    Run a direct adb shell argv call without wrapping it in 'sh -c'.
+
+    This is more reliable for Android's plain multi-file stat output than
+    constructing one large shell string.
+    """
+    return run([adb_path, "shell", *shell_args], check=check)
+
+
 def ensure_adb_device(adb_path: str) -> None:
     """
     Fail early if adb is unavailable or no device is ready.
@@ -150,9 +161,9 @@ def device_supports_find_printf(adb_path: str) -> bool:
 
 def device_supports_multi_stat(adb_path: str) -> bool:
     """
-    Check whether device-side stat is available and can format multiple paths.
+    Check whether device-side stat accepts multiple file operands.
     """
-    probe = "command -v stat >/dev/null 2>&1 && stat -c '%n\t%s\t%Y\t%W' /dev/null /dev/null >/dev/null 2>&1"
+    probe = "command -v stat >/dev/null 2>&1 && stat /dev/null /dev/null >/dev/null 2>&1"
     cp = adb_shell(adb_path, probe, check=False)
     return cp.returncode == 0
 
@@ -344,39 +355,81 @@ fi
     return files
 
 
-def _parse_remote_metadata_line(line: str, remote_root: str) -> Tuple[Optional[str], Optional[int], Optional[int], Optional[int]]:
+def _parse_plain_stat_timestamp(value: str) -> Optional[int]:
     """
-    Parse one metadata line emitted by stat -c '%n\t%s\t%Y\t%W'.
+    Parse one plain 'stat' timestamp line into a UNIX timestamp.
     """
-    parts = line.split("\t")
-    if len(parts) < 2:
-        return None, None, None, None
-
-    remote_path = parts[0]
-    root_prefix = f"{remote_root.rstrip('/')}/"
-    if remote_path.startswith(root_prefix):
-        relpath = remote_path[len(root_prefix):]
-    else:
-        relpath = remote_path
-
+    raw = value.strip()
+    if not raw:
+        return None
+    if "." in raw:
+        head, tail = raw.split(".", 1)
+        if " " in tail:
+            frac, zone = tail.split(" ", 1)
+            raw = f"{head}.{frac[:6]:0<6} {zone}"
     try:
-        size = int(parts[1])
+        return int(datetime.strptime(raw, "%Y-%m-%d %H:%M:%S.%f %z").timestamp())
     except ValueError:
-        return relpath, None, None, None
+        pass
+    try:
+        return int(datetime.strptime(raw, "%Y-%m-%d %H:%M:%S %z").timestamp())
+    except ValueError:
+        return None
 
-    mtime = None
-    birth = None
-    if len(parts) >= 3 and parts[2]:
-        try:
-            mtime = int(parts[2])
-        except ValueError:
-            mtime = None
-    if len(parts) >= 4 and parts[3] and parts[3] != "-1":
-        try:
-            birth = int(parts[3])
-        except ValueError:
-            birth = None
-    return relpath, size, mtime, birth
+
+def parse_plain_stat_output(output: str, remote_root: str) -> Dict[str, Tuple[int, Optional[int], Optional[int]]]:
+    """
+    Parse plain multi-file Android 'stat' output.
+
+    Expected structure per file block is similar to:
+      File: /path
+      Size: 1234 ...
+      ...
+      Modify: 2026-04-11 18:19:12.000000000 +0200
+
+    We use Modify as mtime and leave birth=None because plain Android stat does
+    not expose a portable creation time field in this format.
+    """
+    file_re = re.compile(r"^\s*File:\s+(?P<path>.+)$")
+    size_re = re.compile(r"^\s*Size:\s+(?P<size>\d+)")
+    modify_re = re.compile(r"^\s*Modify:\s+(?P<modify>.+)$")
+
+    parsed: Dict[str, Tuple[int, Optional[int], Optional[int]]] = {}
+    current_path: Optional[str] = None
+    current_size: Optional[int] = None
+    current_mtime: Optional[int] = None
+
+    def flush_current() -> None:
+        nonlocal current_path, current_size, current_mtime
+        if current_path and current_size is not None:
+            root_prefix = f"{remote_root.rstrip('/')}/"
+            relpath = current_path[len(root_prefix):] if current_path.startswith(root_prefix) else current_path
+            parsed[relpath] = (current_size, current_mtime, None)
+        current_path = None
+        current_size = None
+        current_mtime = None
+
+    for line in output.splitlines():
+        file_match = file_re.match(line)
+        if file_match:
+            flush_current()
+            current_path = file_match.group("path").strip()
+            continue
+
+        if current_path is None:
+            continue
+
+        size_match = size_re.match(line)
+        if size_match:
+            current_size = int(size_match.group("size"))
+            continue
+
+        modify_match = modify_re.match(line)
+        if modify_match:
+            current_mtime = _parse_plain_stat_timestamp(modify_match.group("modify"))
+
+    flush_current()
+    return parsed
 
 
 def populate_remote_metadata_batch(
@@ -403,13 +456,11 @@ def populate_remote_metadata_batch(
     for start in range(0, len(pending), chunk_size):
         chunk = pending[start:start + chunk_size]
         by_relpath = {rf.relpath: rf for rf in chunk}
-        quoted_paths = " ".join(quote_remote(remote_join(remote_root, rf.relpath)) for rf in chunk)
-        cp = adb_shell(adb_path, f"stat -c '%n\\t%s\\t%Y\\t%W' {quoted_paths}", check=False)
+        remote_paths = [remote_join(remote_root, rf.relpath) for rf in chunk]
+        cp = adb_shell_args(adb_path, ["stat", *remote_paths], check=False)
+        parsed = parse_plain_stat_output(cp.stdout or "", remote_root)
 
-        for line in (cp.stdout or "").splitlines():
-            relpath, size, mtime, birth = _parse_remote_metadata_line(line, remote_root)
-            if not relpath or size is None:
-                continue
+        for relpath, (size, mtime, birth) in parsed.items():
             rf = by_relpath.get(relpath)
             if not rf:
                 continue
@@ -438,29 +489,13 @@ def ensure_remote_metadata(adb_path: str, remote_root: str, remote_meta: RemoteF
         return remote_meta
 
     remote_path = remote_join(remote_root, remote_meta.relpath)
-    shell_script = f"""
-path={quote_remote(remote_path)}
-if [ ! -f "$path" ]; then
-  echo "Remote file does not exist: $path" >&2
-  exit 2
-fi
+    cp = adb_shell_args(adb_path, ["stat", remote_path])
+    parsed = parse_plain_stat_output(cp.stdout or "", remote_root)
+    metadata = parsed.get(remote_meta.relpath)
+    if metadata is None:
+        raise RuntimeError(f"Remote metadata query returned no parseable output for {remote_meta.relpath}: {(cp.stdout or '').strip()!r}")
 
-if command -v stat >/dev/null 2>&1; then
-  stat -c '%s\t%Y\t%W' "$path"
-else
-  size="$(wc -c < "$path" 2>/dev/null || echo '')"
-  [ -z "$size" ] && exit 3
-  printf '%s\t\t\n' "$size"
-fi
-"""
-    cp = adb_shell(adb_path, shell_script)
-    line = (cp.stdout or "").splitlines()[0].strip() if (cp.stdout or "").splitlines() else ""
-    if not line:
-        raise RuntimeError(f"Remote metadata query returned no output for {remote_meta.relpath}")
-
-    relpath, size, mtime, birth = _parse_remote_metadata_line(f"{remote_path}\t{line}", remote_root)
-    if relpath is None or size is None:
-        raise RuntimeError(f"Remote metadata query returned invalid size for {remote_meta.relpath}: {line!r}")
+    size, mtime, birth = metadata
 
     remote_meta.size = size
     remote_meta.mtime = mtime
