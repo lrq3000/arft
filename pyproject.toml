@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arft"
-version = "0.5.1"
+version = "0.5.2"
 description = "ARFT (Android Robust File Transfer): robust resumable Android file transfer over ADB with atomic operations, resuming, cached discovery and progress reporting."
 readme = "README.md"
 requires-python = ">=3.10"
