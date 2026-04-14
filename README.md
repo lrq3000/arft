@@ -23,7 +23,9 @@ First you need to download and unzip the latest version of ADB (part of [Google'
 
 Secondly you need a Python interpreter. Miniconda is awesome and small.
 
-Then install `arft` using:
+Thirdly you need to enable `USB debugging` = adb debugging on your Android phone (so you need to enable the Developer options).
+
+Fourthly, you can then install `arft` using:
 
 ```bash
 pip install --upgrade arft
