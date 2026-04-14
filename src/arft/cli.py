@@ -89,6 +89,20 @@ def escape_remote_stat_path(path: str) -> str:
     return REMOTE_STAT_META_RE.sub(r"\\\1", path)
 
 
+def configure_console_streams() -> None:
+    """
+    Make console output tolerant of remote file names with unusual Unicode.
+
+    On Windows, stdout/stderr may default to a legacy code page that cannot
+    encode all file names coming from Android. Reconfiguring them to UTF-8 with
+    replacement prevents logging and dry-run output from crashing.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def run(
     cmd: List[str],
     *,
@@ -97,7 +111,13 @@ def run(
     check: bool = True,
     timeout: Optional[int] = None,
 ) -> subprocess.CompletedProcess:
-    """Thin wrapper around subprocess.run with consistent defaults."""
+    """Thin wrapper around subprocess.run with consistent defaults.
+
+    ADB can emit UTF-8 file names and diagnostics that are not representable in
+    the Windows ANSI code page (for example cp1252). We therefore force UTF-8
+    decoding with replacement so unusual remote file names do not crash the
+    subprocess reader thread during output decoding.
+    """
     if VERBOSE_ADB and ADB_LOGGER and cmd:
         executable = os.path.normcase(os.path.normpath(cmd[0]))
         configured = os.path.normcase(os.path.normpath(ADB_EXECUTABLE)) if ADB_EXECUTABLE else None
@@ -111,6 +131,8 @@ def run(
         capture_output=capture_output,
         check=check,
         timeout=timeout,
+        encoding="utf-8" if text else None,
+        errors="replace" if text else None,
     )
 
 
@@ -895,6 +917,8 @@ def sleep_retry(retry_wait: float, attempt: int, total: int) -> None:
 
 def main(argv: Optional[List[str]] = None) -> int:
     global VERBOSE_ADB, ADB_LOGGER, ADB_EXECUTABLE
+
+    configure_console_streams()
 
     parser = argparse.ArgumentParser(description="Robust file-by-file Android pull over ADB with tqdm, retries, and logging.")
     parser.add_argument("--adb-path", required=True, help="Path to adb.exe or adb.")
