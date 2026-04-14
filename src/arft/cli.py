@@ -588,6 +588,15 @@ def manifest_says_file_is_complete(
         return False
 
 
+def local_file_exists_for_fast_skip(local_path: Path) -> bool:
+    """
+    Fastest possible resume check: trust any existing local file.
+
+    This intentionally skips manifest, remote metadata, and hash validation.
+    """
+    return local_path.exists() and local_path.is_file()
+
+
 def file_is_complete(
     local_path: Path,
     remote_meta: RemoteFile,
@@ -799,6 +808,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--force-all", action="store_true", help="Re-copy all files even if already present and complete")
     parser.add_argument("--refresh-file-list", action="store_true", help="Refresh the cached remote file list without forcing re-copy of already complete files")
     parser.add_argument("--check-all-files", action="store_true", help="Revalidate already downloaded files against the device before skipping them")
+    parser.add_argument("--skip-all-checks", action="store_true", help="Skip all existing-file validation checks and trust any already present local file")
     parser.add_argument("--dry-run", action="store_true", help="List planned actions without copying files")
     parser.add_argument("--retries", type=int, default=3, help="Retries per file on failure (default: 3)")
     parser.add_argument("--retry-wait", type=float, default=2.0, help="Seconds to wait between retries (default: 2.0)")
@@ -840,10 +850,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     file_list_cache_exists = file_list_cache_path.exists()
     refresh_file_list = args.force_all or args.refresh_file_list
     recovery_check_all_files = (
-        not manifest_exists
+        not args.skip_all_checks
+        and not manifest_exists
         and local_root_has_payload_files(local_root, manifest_name=args.manifest_name)
     )
     effective_check_all_files = args.check_all_files or recovery_check_all_files
+
+    if args.skip_all_checks:
+        logger.info("Fast resume mode enabled: skipping all existing-file validation checks")
 
     if recovery_check_all_files:
         logger.info(
@@ -876,7 +890,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         save_file_list_cache(file_list_cache_path, remote_root=remote_root, remote_files=remote_files)
         logger.info("Saved remote file list cache to %s", file_list_cache_path)
 
-    if not args.force_all and effective_check_all_files and supports_multi_stat:
+    if not args.force_all and not args.skip_all_checks and effective_check_all_files and supports_multi_stat:
         existing_local_files = [rf for rf in remote_files if (local_root / Path(rf.relpath)).is_file()]
         if existing_local_files:
             logger.info(
@@ -895,7 +909,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         local_path = local_root / Path(rf.relpath)
         complete = False
         if not args.force_all:
-            if manifest_says_file_is_complete(local_path, rf.relpath, manifest) and not effective_check_all_files:
+            if args.skip_all_checks and local_file_exists_for_fast_skip(local_path):
+                complete = True
+            elif manifest_says_file_is_complete(local_path, rf.relpath, manifest) and not effective_check_all_files:
                 complete = True
                 entry = manifest.get(rf.relpath, {})
                 if isinstance(entry.get("size"), int):
