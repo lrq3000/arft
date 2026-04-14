@@ -464,29 +464,45 @@ def populate_remote_metadata_batch(
         return
 
     remote_root = remote_root.rstrip("/")
-    for start in range(0, len(pending), chunk_size):
-        chunk = pending[start:start + chunk_size]
-        by_relpath = {rf.relpath: rf for rf in chunk}
-        remote_paths = [remote_join(remote_root, rf.relpath) for rf in chunk]
-        cp = adb_shell_args(adb_path, ["stat", *remote_paths], check=False)
-        parsed = parse_plain_stat_output(cp.stdout or "", remote_root)
+    metadata_pbar = tqdm(
+        total=len(pending),
+        unit="file",
+        desc=f"{infer_remote_root_name(remote_root)} stat",
+        dynamic_ncols=True,
+        smoothing=0.1,
+    )
+    try:
+        for start in range(0, len(pending), chunk_size):
+            chunk = pending[start:start + chunk_size]
+            by_relpath = {rf.relpath: rf for rf in chunk}
+            remote_paths = [remote_join(remote_root, rf.relpath) for rf in chunk]
+            cp = adb_shell_args(adb_path, ["stat", *remote_paths], check=False)
+            parsed = parse_plain_stat_output(cp.stdout or "", remote_root)
 
-        for relpath, (size, mtime, birth) in parsed.items():
-            rf = by_relpath.get(relpath)
-            if not rf:
-                continue
-            rf.size = size
-            rf.mtime = mtime
-            rf.birth = birth
+            resolved_in_batch = 0
+            for relpath, (size, mtime, birth) in parsed.items():
+                rf = by_relpath.get(relpath)
+                if not rf or rf.size is not None:
+                    continue
+                rf.size = size
+                rf.mtime = mtime
+                rf.birth = birth
+                resolved_in_batch += 1
 
-        # Some devices return partial output or a non-zero exit if one path went
-        # stale mid-run. We only fall back for unresolved entries so the common
-        # case still benefits from batched metadata collection.
-        unresolved = [rf for rf in chunk if rf.size is None]
-        if unresolved:
-            logger.info("Batched stat missed %d/%d files; falling back to single-file metadata queries", len(unresolved), len(chunk))
-            for rf in unresolved:
-                ensure_remote_metadata(adb_path, remote_root, rf)
+            if resolved_in_batch:
+                metadata_pbar.update(resolved_in_batch)
+
+            # Some devices return partial output or a non-zero exit if one path went
+            # stale mid-run. We only fall back for unresolved entries so the common
+            # case still benefits from batched metadata collection.
+            unresolved = [rf for rf in chunk if rf.size is None]
+            if unresolved:
+                logger.info("Batched stat missed %d/%d files; falling back to single-file metadata queries", len(unresolved), len(chunk))
+                for rf in unresolved:
+                    ensure_remote_metadata(adb_path, remote_root, rf)
+                    metadata_pbar.update(1)
+    finally:
+        metadata_pbar.close()
 
 
 def ensure_remote_metadata(adb_path: str, remote_root: str, remote_meta: RemoteFile) -> RemoteFile:
