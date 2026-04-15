@@ -1,6 +1,9 @@
 # arft
 
-**arft** stands for **Android Robust File Transfer**.
+![PyPI - Version](https://img.shields.io/pypi/v/:packageName)
+
+
+**arft** stands for **Android Robust File/Folder Transfer**.
 
 It provides robust Android file-by-file transfer over ADB with resumable behavior, atomic writes, lazy remote metadata fetching, cached remote file discovery, and `tqdm` progress reporting for checking, metadata prefetch, and transfer.
 
