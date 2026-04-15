@@ -1,6 +1,6 @@
 # arft
 
-![PyPI - Version](https://img.shields.io/pypi/v/:packageName)
+![PyPI - Version](https://img.shields.io/pypi/v/arft)
 
 
 **arft** stands for **Android Robust File/Folder Transfer**.
