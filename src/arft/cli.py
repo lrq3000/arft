@@ -38,11 +38,13 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
     from tqdm import tqdm
@@ -53,9 +55,13 @@ except Exception as exc:  # pragma: no cover
 
 # ----------------------------- Data structures ----------------------------- #
 
-VERBOSE_ADB = False
-ADB_LOGGER: Optional[logging.Logger] = None
-ADB_EXECUTABLE: Optional[str] = None
+verbose_adb = False
+adb_logger: Optional[logging.Logger] = None
+adb_executable: Optional[str] = None
+ARCHIVE_STATE_SCHEMA_VERSION = 1
+DEFAULT_ARCHIVE_CHUNK_SIZE = 256 * 1024 * 1024
+DEFAULT_ARCHIVE_MAX_FILES_PER_CHUNK = 512
+ARCHIVE_MAX_REMOTE_COMMAND_CHARS = 24_000
 
 @dataclass
 class RemoteFile:
@@ -65,6 +71,23 @@ class RemoteFile:
     size: Optional[int] = None
     mtime: Optional[int] = None
     birth: Optional[int] = None
+
+
+@dataclass
+class ArchiveChunk:
+    index: int
+    files: List[RemoteFile]
+    estimated_size: int
+
+    @property
+    def chunk_id(self) -> str:
+        return f"chunk-{self.index:06d}"
+
+
+@dataclass
+class ArchiveToolProbe:
+    supported: bool
+    reasons: List[str]
 
 
 # ------------------------------- Utilities -------------------------------- #
@@ -103,6 +126,65 @@ def configure_console_streams() -> None:
             reconfigure(encoding="utf-8", errors="replace")
 
 
+def parse_size_spec(value: str) -> int:
+    """
+    Parse human-friendly byte sizes such as ``256M`` or ``1G``.
+
+    Archive streaming uses this to keep retry loss bounded by an approximate
+    uncompressed chunk size. The parser intentionally accepts only binary units
+    so command-line values are deterministic across platforms.
+    """
+    match = re.fullmatch(r"\s*(\d+)\s*([kKmMgG]?[bB]?)?\s*", value)
+    if not match:
+        raise argparse.ArgumentTypeError("size must be an integer optionally followed by K, M, or G")
+    amount = int(match.group(1))
+    suffix = (match.group(2) or "").lower().rstrip("b")
+    multiplier = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3}.get(suffix)
+    if multiplier is None:
+        raise argparse.ArgumentTypeError("size suffix must be K, M, or G")
+    size = amount * multiplier
+    if size <= 0:
+        raise argparse.ArgumentTypeError("size must be greater than zero")
+    return size
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """
+    Build the CLI parser separately from ``main`` so tests can lock the default
+    mode without needing a real Android device.
+    """
+    parser = argparse.ArgumentParser(description="Robust Android pull over ADB with resumable file and archive-stream modes.")
+    parser.add_argument("--adb-path", required=True, help="Path to adb.exe or adb.")
+    parser.add_argument("--remote-root", required=True, help="Remote Android root, e.g. /storage/emulated/0/DCIM")
+    parser.add_argument("--local-root", required=True, help="Destination directory on the PC")
+    parser.add_argument("--verbose", action="store_true", help="Log every issued ADB command")
+    parser.add_argument("--transfer-mode", choices=("files", "archive-stream"), default="files", help="Transfer backend: current per-file mode, or chunked tar.gz over adb exec-out (default: files)")
+    parser.add_argument("--archive-chunk-size", type=parse_size_spec, default=DEFAULT_ARCHIVE_CHUNK_SIZE, help="Approximate uncompressed size per archive-stream chunk, e.g. 256M (default: 256M)")
+    parser.add_argument("--archive-max-files-per-chunk", type=int, default=DEFAULT_ARCHIVE_MAX_FILES_PER_CHUNK, help="Safety cap for files per archive-stream chunk (default: 512)")
+    parser.add_argument("--archive-compression-level", type=int, default=1, choices=range(1, 10), metavar="1-9", help="gzip level for archive-stream mode (default: 1)")
+    parser.add_argument("--verify-hash", action="store_true", help="Verify SHA-256 after size verification")
+    parser.add_argument("--force-all", action="store_true", help="Re-copy all files even if already present and complete")
+    parser.add_argument("--refresh-file-list", action="store_true", help="Refresh the cached remote file list without forcing re-copy of already complete files")
+    parser.add_argument("--check-all-files", action="store_true", help="Revalidate already downloaded files against the device before skipping them")
+    parser.add_argument("--skip-all-checks", action="store_true", help="Skip all existing-file validation checks and trust any already present local file")
+    parser.add_argument("--exclude", metavar="REGEXP", help="Regex applied to remote relative paths to exclude matching files and subpaths from planning and transfer")
+    parser.add_argument("--dry-run", action="store_true", help="List planned actions without copying files")
+    parser.add_argument("--retries", type=int, default=3, help="Retries per file or archive chunk on failure (default: 3)")
+    parser.add_argument("--retry-wait", type=float, default=2.0, help="Seconds to wait between retries (default: 2.0)")
+    parser.add_argument("--manifest-name", default=".arft-local-sync-state.json", help="Manifest filename in the destination root")
+    return parser
+
+
+def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """
+    Validate cross-option constraints while keeping archive-stream opt-in only.
+    """
+    if args.archive_max_files_per_chunk <= 0:
+        parser.error("--archive-max-files-per-chunk must be greater than zero")
+    if args.transfer_mode == "archive-stream" and args.verify_hash:
+        parser.error("--verify-hash is only supported by --transfer-mode files; archive-stream uses chunk checksums and extracted-file size checks")
+
+
 def run(
     cmd: List[str],
     *,
@@ -110,7 +192,7 @@ def run(
     capture_output: bool = True,
     check: bool = True,
     timeout: Optional[int] = None,
-) -> subprocess.CompletedProcess:
+) -> subprocess.CompletedProcess[str]:
     """Thin wrapper around subprocess.run with consistent defaults.
 
     ADB can emit UTF-8 file names and diagnostics that are not representable in
@@ -118,13 +200,13 @@ def run(
     decoding with replacement so unusual remote file names do not crash the
     subprocess reader thread during output decoding.
     """
-    if VERBOSE_ADB and ADB_LOGGER and cmd:
+    if verbose_adb and adb_logger and cmd:
         executable = os.path.normcase(os.path.normpath(cmd[0]))
-        configured = os.path.normcase(os.path.normpath(ADB_EXECUTABLE)) if ADB_EXECUTABLE else None
+        configured = os.path.normcase(os.path.normpath(adb_executable)) if adb_executable else None
         if configured is None or executable == configured:
             # Use shell-style quoting so the emitted command is copy-pasteable and
             # easy to grep in the persistent transfer log.
-            ADB_LOGGER.info("ADB CMD: %s", shlex.join(cmd))
+            adb_logger.info("ADB CMD: %s", shlex.join(cmd))
     return subprocess.run(
         cmd,
         text=text,
@@ -136,7 +218,7 @@ def run(
     )
 
 
-def adb_shell(adb_path: str, shell_cmd: str, *, check: bool = True) -> subprocess.CompletedProcess:
+def adb_shell(adb_path: str, shell_cmd: str, *, check: bool = True) -> subprocess.CompletedProcess[str]:
     """
     Run a shell command on the Android device.
 
@@ -146,7 +228,7 @@ def adb_shell(adb_path: str, shell_cmd: str, *, check: bool = True) -> subproces
     return run([adb_path, "shell", "sh", "-c", shell_cmd], check=check)
 
 
-def adb_shell_args(adb_path: str, shell_args: List[str], *, check: bool = True) -> subprocess.CompletedProcess:
+def adb_shell_args(adb_path: str, shell_args: List[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
     """
     Run a direct adb shell argv call without wrapping it in 'sh -c'.
 
@@ -913,38 +995,527 @@ def sleep_retry(retry_wait: float, attempt: int, total: int) -> None:
         time.sleep(retry_wait)
 
 
+# -------------------------- Archive stream transfer ------------------------- #
+
+def load_json_object(path: Path) -> Dict[str, object]:
+    """
+    Load an archive-mode JSON state object, returning an empty object if absent.
+    """
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_json_object(path: Path, payload: Dict[str, object]) -> None:
+    """
+    Atomically write JSON state used by archive transfer and extraction journals.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
+def probe_archive_tools(adb_path: str) -> ArchiveToolProbe:
+    """
+    Verify that the device can run the simple tar/gzip pipeline used by archive-stream.
+
+    The probe deliberately checks command behavior instead of only relying on
+    ``toybox`` help output, because Android builds differ in what applets are
+    exposed as standalone shell commands.
+    """
+    reasons: List[str] = []
+    tar_cp = adb_shell(adb_path, "(command -v tar >/dev/null 2>&1 || toybox tar --help >/dev/null 2>&1)", check=False)
+    gzip_cp = adb_shell(adb_path, "(command -v gzip >/dev/null 2>&1 || toybox gzip --help >/dev/null 2>&1)", check=False)
+    if tar_cp.returncode != 0:
+        reasons.append("missing_tar")
+    if gzip_cp.returncode != 0:
+        reasons.append("missing_gzip")
+    if reasons:
+        return ArchiveToolProbe(False, reasons)
+
+    smoke = "tmp=${TMPDIR:-/data/local/tmp}/arft-probe-$$; mkdir -p \"$tmp\" && printf probe > \"$tmp/file\" && (cd \"$tmp\" && tar -cf - file | gzip -1 >/dev/null); rc=$?; rm -rf \"$tmp\"; exit $rc"
+    smoke_cp = adb_shell(adb_path, smoke, check=False)
+    if smoke_cp.returncode != 0:
+        reasons.append("smoke_failed")
+    return ArchiveToolProbe(not reasons, reasons)
+
+
+def estimate_remote_command_chars(remote_root: str, files: Sequence[RemoteFile], compression_level: int) -> int:
+    """
+    Estimate shell command size so archive chunks do not exceed platform limits.
+    """
+    base = len(f"cd {quote_remote(remote_root)} && tar -cf - | gzip -{compression_level}")
+    return base + sum(len(shlex.quote(f"./{rf.relpath}")) + 1 for rf in files)
+
+
+def plan_archive_chunks(
+    remote_files: Sequence[RemoteFile],
+    *,
+    target_chunk_size: int,
+    max_files_per_chunk: int,
+    remote_root: str,
+    compression_level: int,
+) -> List[ArchiveChunk]:
+    """
+    Build deterministic chunks by estimated uncompressed bytes, then by command size.
+    """
+    chunks: List[ArchiveChunk] = []
+    current: List[RemoteFile] = []
+    current_size = 0
+
+    def flush() -> None:
+        nonlocal current, current_size
+        if not current:
+            return
+        chunks.append(ArchiveChunk(index=len(chunks) + 1, files=current, estimated_size=current_size))
+        current = []
+        current_size = 0
+
+    for rf in remote_files:
+        file_size = rf.size if isinstance(rf.size, int) else 0
+        prospective = [*current, rf]
+        too_many_files = len(prospective) > max_files_per_chunk
+        too_many_bytes = bool(current) and current_size + file_size > target_chunk_size
+        too_long_command = bool(current) and estimate_remote_command_chars(remote_root, prospective, compression_level) > ARCHIVE_MAX_REMOTE_COMMAND_CHARS
+        if too_many_files or too_many_bytes or too_long_command:
+            flush()
+        current.append(rf)
+        current_size += file_size
+        if estimate_remote_command_chars(remote_root, current, compression_level) > ARCHIVE_MAX_REMOTE_COMMAND_CHARS:
+            raise RuntimeError(f"Remote path is too long for archive-stream command construction: {rf.relpath}")
+    flush()
+    return chunks
+
+
+def archive_chunk_command(remote_root: str, files: Sequence[RemoteFile], compression_level: int) -> str:
+    """
+    Build the remote tar/gzip command for one self-contained archive chunk.
+    """
+    if not files:
+        raise ValueError("archive chunk cannot be empty")
+    quoted_files = " ".join(shlex.quote(f"./{rf.relpath}") for rf in files)
+    return f"cd {quote_remote(remote_root)} && tar -cf - {quoted_files} | gzip -{compression_level}"
+
+
+class HashingReader:
+    """
+    File-like adapter that hashes compressed bytes while tarfile streams them.
+    """
+
+    def __init__(self, raw) -> None:
+        self.raw = raw
+        self.digest = hashlib.sha256()
+        self.bytes_read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        data = self.raw.read(size)
+        if data:
+            self.digest.update(data)
+            self.bytes_read += len(data)
+        return data
+
+    def write(self, data: bytes) -> int:
+        raise OSError("HashingReader is read-only")
+
+    def tell(self) -> int:
+        return self.bytes_read
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        raise OSError("HashingReader is not seekable")
+
+    def close(self) -> None:
+        close = getattr(self.raw, "close", None)
+        if callable(close):
+            close()
+
+    def hexdigest(self) -> str:
+        return self.digest.hexdigest()
+
+
+def normalized_archive_member_name(member_name: str) -> str:
+    """
+    Normalize the tar member path into ARFT's relative-path namespace.
+    """
+    normalized = member_name.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def validate_archive_member(member: tarfile.TarInfo, expected_relpaths: set[str], local_root: Path) -> str:
+    """
+    Accept only expected regular-file members inside the destination tree.
+    """
+    relpath = normalized_archive_member_name(member.name)
+    if member.name.startswith("/") or relpath.startswith("../") or "/../" in f"/{relpath}/":
+        raise RuntimeError(f"Unsafe archive member path: {member.name}")
+    if relpath not in expected_relpaths:
+        raise RuntimeError(f"Unexpected archive member: {member.name}")
+    if not member.isfile():
+        raise RuntimeError(f"Unsupported archive member type for {member.name}; only regular files are allowed")
+    target = (local_root / Path(relpath)).resolve()
+    dest_root = local_root.resolve()
+    if dest_root != target and dest_root not in target.parents:
+        raise RuntimeError(f"Unsafe archive member path: {member.name}")
+    return relpath
+
+
+def discard_stream(stream, chunk_size: int = 1024 * 1024) -> None:
+    """
+    Consume a tar member stream when the file is already completed locally.
+    """
+    while stream.read(chunk_size):
+        pass
+
+
+def stream_extract_archive_chunk(
+    adb_path: str,
+    remote_root: str,
+    local_root: Path,
+    chunk: ArchiveChunk,
+    *,
+    compression_level: int,
+    manifest: Dict[str, Dict[str, object]],
+    manifest_path: Path,
+    restore_journal: Dict[str, object],
+    restore_journal_path: Path,
+    logger: logging.Logger,
+) -> Tuple[bool, str, str, int]:
+    """
+    Stream one remote tar.gz chunk and extract each file via .part + atomic replace.
+    """
+    shell_cmd = archive_chunk_command(remote_root, chunk.files, compression_level)
+    cmd = [adb_path, "exec-out", "sh", "-c", shell_cmd]
+    if verbose_adb and adb_logger:
+        adb_logger.info("ADB CMD: %s", shlex.join(cmd))
+
+    by_relpath = {rf.relpath: rf for rf in chunk.files}
+    expected_relpaths = set(by_relpath)
+    seen_relpaths: set[str] = set()
+    journal_entry = chunk_state_entry(restore_journal, chunk.chunk_id)
+    journal_entry["file_relpaths"] = [rf.relpath for rf in chunk.files]
+    files_state = journal_entry.setdefault("files", {})
+    if not isinstance(files_state, dict):
+        journal_entry["files"] = {}
+        files_state = journal_entry["files"]
+
+    with tempfile.TemporaryFile() as stderr_file:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr_file)
+        if proc.stdout is None:
+            proc.kill()
+            proc.wait()
+            return False, "adb exec-out did not expose stdout", "", 0
+        hashing_reader = HashingReader(proc.stdout)
+        try:
+            with tarfile.open(fileobj=hashing_reader, mode="r|gz") as tar:
+                for member in tar:
+                    relpath = validate_archive_member(member, expected_relpaths, local_root)
+                    seen_relpaths.add(relpath)
+                    rf = by_relpath[relpath]
+                    member_stream = tar.extractfile(member)
+                    if member_stream is None:
+                        raise RuntimeError(f"archive member has no readable stream: {member.name}")
+
+                    local_final = local_root / Path(relpath)
+                    if files_state.get(relpath) == "ok" and manifest_says_file_is_complete(local_final, relpath, manifest):
+                        discard_stream(member_stream)
+                        continue
+
+                    local_final.parent.mkdir(parents=True, exist_ok=True)
+                    local_part = local_final.with_name(local_final.name + ".part")
+                    safe_remove(local_part, logger)
+                    try:
+                        with local_part.open("wb") as out:
+                            shutil.copyfileobj(member_stream, out, length=1024 * 1024)
+                        expected_size = rf.size
+                        actual_size = local_part.stat().st_size if local_part.exists() else -1
+                        if expected_size is None or actual_size != expected_size or member.size != expected_size:
+                            raise RuntimeError(f"size mismatch for {relpath}: remote={expected_size} member={member.size} local={actual_size}")
+                        try:
+                            apply_timestamps(local_part, rf)
+                        except Exception as exc:
+                            logger.warning("Could not apply timestamps to extracted temp %s: %s", local_part, exc)
+                        local_part.replace(local_final)
+                        try:
+                            apply_timestamps(local_final, rf)
+                        except Exception as exc:
+                            logger.warning("Could not apply timestamps to extracted %s: %s", local_final, exc)
+                        manifest[relpath] = {
+                            "status": "ok",
+                            "size": rf.size,
+                            "mtime": rf.mtime,
+                            "birth": rf.birth,
+                            "local_path": str(local_final),
+                            "transfer_mode": "archive-stream",
+                            "chunk_id": chunk.chunk_id,
+                            "updated_at": int(time.time()),
+                        }
+                        files_state[relpath] = "ok"
+                        journal_entry["updated_at"] = int(time.time())
+                        save_manifest(manifest_path, manifest)
+                        save_json_object(restore_journal_path, restore_journal)
+                    finally:
+                        safe_remove(local_part, logger)
+        except Exception as exc:
+            proc.kill()
+            proc.wait()
+            return False, f"stream extraction failed: {exc}", hashing_reader.hexdigest(), hashing_reader.bytes_read
+
+        returncode = proc.wait()
+        stderr_file.seek(0)
+        stderr_bytes = stderr_file.read()
+        if returncode != 0:
+            stderr = stderr_bytes.decode("utf-8", errors="replace") if isinstance(stderr_bytes, bytes) else str(stderr_bytes)
+            return False, f"adb exec-out tar.gz failed: {stderr.strip()}", hashing_reader.hexdigest(), hashing_reader.bytes_read
+        missing = expected_relpaths - seen_relpaths
+        if missing:
+            return False, f"archive stream missed expected files: {', '.join(sorted(missing)[:5])}", hashing_reader.hexdigest(), hashing_reader.bytes_read
+        return True, "ok", hashing_reader.hexdigest(), hashing_reader.bytes_read
+
+
+def safe_tar_members(tar: tarfile.TarFile, destination: Path) -> List[tarfile.TarInfo]:
+    """
+    Legacy test helper: reject path traversal before bulk extraction.
+
+    The production archive-stream path uses ``validate_archive_member`` and does
+    not call ``extractall``; this helper remains for focused path-safety tests.
+    """
+    dest_root = destination.resolve()
+    members = tar.getmembers()
+    for member in members:
+        target = (destination / member.name).resolve()
+        if dest_root != target and dest_root not in target.parents:
+            raise RuntimeError(f"Unsafe archive member path: {member.name}")
+    return members
+
+
+def chunk_state_entry(state: Dict[str, object], chunk_id: str) -> Dict[str, object]:
+    chunks = state.setdefault("chunks", {})
+    if not isinstance(chunks, dict):
+        state["chunks"] = {}
+        chunks = state["chunks"]
+    entry = chunks.setdefault(chunk_id, {})
+    if not isinstance(entry, dict):
+        chunks[chunk_id] = {}
+        entry = chunks[chunk_id]
+    return entry
+
+
+def run_archive_stream_mode(
+    *,
+    adb_path: str,
+    remote_root: str,
+    local_root: Path,
+    remote_files: List[RemoteFile],
+    manifest: Dict[str, Dict[str, object]],
+    manifest_path: Path,
+    args: argparse.Namespace,
+    logger: logging.Logger,
+    supports_multi_stat: bool,
+    check_all_files: bool,
+) -> int:
+    """
+    Run chunked tar.gz over adb exec-out with immediate local extraction.
+    """
+    probe = probe_archive_tools(adb_path)
+    if not probe.supported:
+        logger.error(
+            "Archive-stream mode requires working tar and gzip on the phone; probe failed: %s. Use --transfer-mode files as fallback.",
+            ", ".join(probe.reasons),
+        )
+        return 2
+
+    archive_state_path = local_root / ".arft-archive-state.json"
+    archive_journal_path = local_root / ".arft-archive-restore-journal.json"
+    archive_state = load_json_object(archive_state_path)
+    restore_journal = load_json_object(archive_journal_path)
+    archive_state.update({
+        "schema_version": ARCHIVE_STATE_SCHEMA_VERSION,
+        "mode": "archive-stream",
+        "remote_root": remote_root,
+        "chunk_size": args.archive_chunk_size,
+        "compression": "gzip",
+        "compression_level": args.archive_compression_level,
+    })
+    restore_journal.update({
+        "schema_version": ARCHIVE_STATE_SCHEMA_VERSION,
+        "mode": "archive-stream",
+        "remote_root": remote_root,
+    })
+
+    todo: List[RemoteFile] = []
+    skipped = 0
+    for rf in remote_files:
+        local_path = local_root / Path(rf.relpath)
+        complete = False
+        if not args.force_all:
+            if args.skip_all_checks and local_file_exists_for_fast_skip(local_path):
+                complete = True
+            elif manifest_says_file_is_complete(local_path, rf.relpath, manifest) and not check_all_files:
+                complete = True
+                entry = manifest.get(rf.relpath, {})
+                entry_size = entry.get("size")
+                entry_mtime = entry.get("mtime")
+                entry_birth = entry.get("birth")
+                if isinstance(entry_size, int):
+                    rf.size = entry_size
+                if isinstance(entry_mtime, int):
+                    rf.mtime = entry_mtime
+                if isinstance(entry_birth, int):
+                    rf.birth = entry_birth
+            elif check_all_files:
+                try:
+                    complete = file_is_complete(
+                        local_path,
+                        rf,
+                        verify_hash=False,
+                        adb_path=adb_path,
+                        remote_root=remote_root,
+                        hash_cmd=None,
+                        logger=logger,
+                        check_all_files=True,
+                    )
+                except Exception as exc:
+                    logger.warning("Could not validate existing file %s for archive-stream skip, will stream again: %s", local_path, exc)
+        if complete:
+            skipped += 1
+        else:
+            todo.append(rf)
+
+    if todo and supports_multi_stat:
+        populate_remote_metadata_batch(adb_path, remote_root, todo, logger)
+    for rf in todo:
+        ensure_remote_metadata(adb_path, remote_root, rf)
+
+    try:
+        chunks = plan_archive_chunks(
+            todo,
+            target_chunk_size=args.archive_chunk_size,
+            max_files_per_chunk=args.archive_max_files_per_chunk,
+            remote_root=remote_root,
+            compression_level=args.archive_compression_level,
+        )
+    except Exception as exc:
+        logger.error("Could not plan archive-stream chunks: %s", exc)
+        return 2
+    archive_state["planned_chunks"] = [
+        {"id": chunk.chunk_id, "file_count": len(chunk.files), "estimated_size": chunk.estimated_size, "files": [rf.relpath for rf in chunk.files]}
+        for chunk in chunks
+    ]
+    save_json_object(archive_state_path, archive_state)
+    save_json_object(archive_journal_path, restore_journal)
+
+    logger.info("Archive-stream planned: total=%d files, skipped=%d, chunks=%d", len(remote_files), skipped, len(chunks))
+    if args.dry_run:
+        for chunk in chunks:
+            print(f"{chunk.chunk_id}\t{len(chunk.files)} files\t{chunk.estimated_size} bytes")
+        return 0
+
+    failed: List[Tuple[str, str]] = []
+    pbar = tqdm(total=max(len(remote_files), 1), initial=skipped, unit="file", desc=f"{infer_remote_root_name(remote_root)} archive", dynamic_ncols=True, smoothing=0.1)
+    try:
+        for chunk in chunks:
+            state_entry = chunk_state_entry(archive_state, chunk.chunk_id)
+            journal_entry = chunk_state_entry(restore_journal, chunk.chunk_id)
+            chunk_relpaths = [rf.relpath for rf in chunk.files]
+            journal_relpaths = journal_entry.get("file_relpaths")
+
+            if journal_entry.get("status") == "extracted":
+                same_plan = journal_relpaths == chunk_relpaths
+                still_complete = all(
+                    manifest_says_file_is_complete(local_root / Path(rf.relpath), rf.relpath, manifest)
+                    for rf in chunk.files
+                )
+                if not same_plan or not still_complete:
+                    logger.info("Ignoring stale archive journal entry for %s; chunk plan or manifest state changed", chunk.chunk_id)
+                    journal_entry.clear()
+                    state_entry.clear()
+                    save_json_object(archive_state_path, archive_state)
+                    save_json_object(archive_journal_path, restore_journal)
+
+            if journal_entry.get("status") != "extracted":
+                ok = False
+                reason = "unknown"
+                stream_hash = ""
+                stream_bytes = 0
+                for attempt in range(1, max(1, args.retries) + 1):
+                    pbar.set_postfix_str(f"{chunk.chunk_id} stream {attempt}/{max(1, args.retries)}")
+                    ok, reason, stream_hash, stream_bytes = stream_extract_archive_chunk(
+                        adb_path,
+                        remote_root,
+                        local_root,
+                        chunk,
+                        compression_level=args.archive_compression_level,
+                        manifest=manifest,
+                        manifest_path=manifest_path,
+                        restore_journal=restore_journal,
+                        restore_journal_path=archive_journal_path,
+                        logger=logger,
+                    )
+                    if ok:
+                        break
+                    logger.warning("%s stream/extract failed: %s", chunk.chunk_id, reason)
+                    sleep_retry(max(0.0, args.retry_wait), attempt, max(1, args.retries))
+                if not ok:
+                    failed.append((chunk.chunk_id, reason))
+                    break
+                state_entry.update({
+                    "status": "streamed",
+                    "file_relpaths": chunk_relpaths,
+                    "stream_sha256": stream_hash,
+                    "compressed_bytes": stream_bytes,
+                    "updated_at": int(time.time()),
+                })
+                journal_entry.update({"status": "extracted", "updated_at": int(time.time()), "file_count": len(chunk.files), "file_relpaths": chunk_relpaths})
+                save_json_object(archive_state_path, archive_state)
+                save_json_object(archive_journal_path, restore_journal)
+            pbar.update(len(chunk.files))
+    finally:
+        pbar.close()
+
+    if failed:
+        failed_path = local_root / ".arft-failed-files.tsv"
+        with failed_path.open("w", encoding="utf-8", newline="\n") as f:
+            f.write("relpath\treason\n")
+            for relpath, reason in failed:
+                f.write(f"{relpath}\t{reason.replace(chr(9), ' ').replace(chr(10), ' ')}\n")
+        logger.error("Archive-stream failed; failure list written to %s", failed_path)
+        return 1
+
+    archive_state["status"] = "complete"
+    restore_journal["status"] = "complete"
+    archive_state["completed_at"] = int(time.time())
+    restore_journal["completed_at"] = int(time.time())
+    save_json_object(archive_state_path, archive_state)
+    save_json_object(archive_journal_path, restore_journal)
+    logger.info("Archive-stream summary: ok=%d/%d, chunks=%d", skipped + sum(len(chunk.files) for chunk in chunks), len(remote_files), len(chunks))
+    return 0
+
+
 # ---------------------------------- Main ---------------------------------- #
 
 def main(argv: Optional[List[str]] = None) -> int:
-    global VERBOSE_ADB, ADB_LOGGER, ADB_EXECUTABLE
+    global verbose_adb, adb_logger, adb_executable
 
     configure_console_streams()
 
-    parser = argparse.ArgumentParser(description="Robust file-by-file Android pull over ADB with tqdm, retries, and logging.")
-    parser.add_argument("--adb-path", required=True, help="Path to adb.exe or adb.")
-    parser.add_argument("--remote-root", required=True, help="Remote Android root, e.g. /storage/emulated/0/DCIM")
-    parser.add_argument("--local-root", required=True, help="Destination directory on the PC")
-    parser.add_argument("--verbose", action="store_true", help="Log every issued ADB command")
-    parser.add_argument("--verify-hash", action="store_true", help="Verify SHA-256 after size verification")
-    parser.add_argument("--force-all", action="store_true", help="Re-copy all files even if already present and complete")
-    parser.add_argument("--refresh-file-list", action="store_true", help="Refresh the cached remote file list without forcing re-copy of already complete files")
-    parser.add_argument("--check-all-files", action="store_true", help="Revalidate already downloaded files against the device before skipping them")
-    parser.add_argument("--skip-all-checks", action="store_true", help="Skip all existing-file validation checks and trust any already present local file")
-    parser.add_argument("--exclude", metavar="REGEXP", help="Regex applied to remote relative paths to exclude matching files and subpaths from planning and transfer")
-    parser.add_argument("--dry-run", action="store_true", help="List planned actions without copying files")
-    parser.add_argument("--retries", type=int, default=3, help="Retries per file on failure (default: 3)")
-    parser.add_argument("--retry-wait", type=float, default=2.0, help="Seconds to wait between retries (default: 2.0)")
-    parser.add_argument("--manifest-name", default=".arft-local-sync-state.json", help="Manifest filename in the destination root")
+    parser = build_parser()
     args = parser.parse_args(argv)
+    validate_args(parser, args)
 
     adb_path = args.adb_path
     remote_root = args.remote_root.rstrip("/")
     local_root = Path(args.local_root).expanduser().resolve()
 
     logger = configure_logger(local_root)
-    VERBOSE_ADB = args.verbose
-    ADB_LOGGER = logger
-    ADB_EXECUTABLE = adb_path
+    verbose_adb = args.verbose
+    adb_logger = logger
+    adb_executable = adb_path
 
     try:
         ensure_adb_device(adb_path)
@@ -1026,6 +1597,20 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     remote_files = filter_remote_files(remote_files, exclude_subpaths_re, logger)
 
+    if args.transfer_mode == "archive-stream":
+        return run_archive_stream_mode(
+            adb_path=adb_path,
+            remote_root=remote_root,
+            local_root=local_root,
+            remote_files=remote_files,
+            manifest=manifest,
+            manifest_path=manifest_path,
+            args=args,
+            logger=logger,
+            supports_multi_stat=supports_multi_stat,
+            check_all_files=effective_check_all_files,
+        )
+
     if not args.force_all and not args.skip_all_checks and effective_check_all_files and supports_multi_stat:
         existing_local_files = [rf for rf in remote_files if (local_root / Path(rf.relpath)).is_file()]
         if existing_local_files:
@@ -1058,12 +1643,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 elif manifest_says_file_is_complete(local_path, rf.relpath, manifest) and not effective_check_all_files:
                     complete = True
                     entry = manifest.get(rf.relpath, {})
-                    if isinstance(entry.get("size"), int):
-                        rf.size = entry["size"]
-                    if isinstance(entry.get("mtime"), int):
-                        rf.mtime = entry["mtime"]
-                    if isinstance(entry.get("birth"), int):
-                        rf.birth = entry["birth"]
+                    entry_size = entry.get("size")
+                    entry_mtime = entry.get("mtime")
+                    entry_birth = entry.get("birth")
+                    if isinstance(entry_size, int):
+                        rf.size = entry_size
+                    if isinstance(entry_mtime, int):
+                        rf.mtime = entry_mtime
+                    if isinstance(entry_birth, int):
+                        rf.birth = entry_birth
                 else:
                     try:
                         complete = file_is_complete(

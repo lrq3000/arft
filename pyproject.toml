@@ -32,6 +32,11 @@ classifiers = [
   "Topic :: Utilities"
 ]
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=8"
+]
+
 [project.urls]
 Homepage = "https://github.com/lrq3000/arft"
 Documentation = "https://github.com/lrq3000/arft/blob/master/README.rst"
